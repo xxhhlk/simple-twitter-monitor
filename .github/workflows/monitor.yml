@@ -19,7 +19,7 @@ jobs:
     env:
       SCWEET_AUTH_TOKEN: ${{ secrets.SCWEET_AUTH_TOKEN }}
       TARGET_ACCOUNT: ${{ vars.TARGET_ACCOUNT || 'WorkBuddy_AI' }}
-      INITIAL_HOURS: ${{ vars.INITIAL_HOURS || '24' }}
+      INITIAL_HOURS: ${{ vars.INITIAL_HOURS || '72' }}
       MAX_TWEETS_PER_FETCH: ${{ vars.MAX_TWEETS_PER_FETCH || '100' }}
       DB_PATH: monitor.db
       EXCLUDE_REPLIES: ${{ vars.EXCLUDE_REPLIES || 'true' }}

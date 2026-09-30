@@ -24,7 +24,7 @@ LOG = logging.getLogger("workbuddy-free-monitor")
 
 DEFAULT_ACCOUNT = "WorkBuddy_AI"
 DEFAULT_POLL_SECONDS = 600
-DEFAULT_INITIAL_HOURS = 24
+DEFAULT_INITIAL_HOURS = 72
 DEFAULT_DB_PATH = "monitor.db"
 DEFAULT_SCWEET_DB_PATH = "scweet_state.db"
 DEFAULT_MAX_TWEETS_PER_FETCH = 100
