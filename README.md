@@ -26,10 +26,14 @@ Linux/macOS：
 
 Scweet 使用 X 登录 Cookie 中的 `auth_token`。它相当于账号凭据：建议使用专门用于监控的 X 账号，并且只把这个值放在本机环境变量或 GitHub Actions Secret 中。不要写进代码、提交到仓库、发到聊天里或放进截图。X 的接口和非官方客户端可能变化，Cookie 也可能过期或触发 X 的风控。
 
+如果 GitHub Actions 日志显示 `Auth bootstrap ... response_status=403`，可以额外设置同一浏览器登录会话中的 `ct0` Cookie 为 `SCWEET_CT0`。程序会直接导入 `auth_token` 和 `ct0`，跳过 X 首页的认证初始化。两项 Cookie 都是敏感凭据，只通过本机环境变量或 GitHub Actions Secrets 配置；不要发到聊天、截图或代码仓库。此方式只能绕过首页初始化，若后续 X API 请求也被 runner 拒绝，仍需改用能访问 X 的运行环境。
+
 本机 PowerShell 示例：
 
 ```powershell
 $env:SCWEET_AUTH_TOKEN = "你的 X auth_token Cookie 值"
+# 仅当 GitHub Actions 初始化遇到 403 时设置，必须与 auth_token 来自同一会话
+# $env:SCWEET_CT0 = "同一会话的 ct0 Cookie 值"
 $env:TARGET_ACCOUNT = "WorkBuddy_AI"
 $env:DB_PATH = ".\monitor.db"
 $env:SCWEET_DB_PATH = ".\scweet_state.db"
@@ -44,6 +48,8 @@ Linux/macOS 示例：
 
 ```bash
 export SCWEET_AUTH_TOKEN='你的 X auth_token Cookie 值'
+# 仅当 GitHub Actions 初始化遇到 403 时取消注释，并填同一会话的 ct0 Cookie
+# export SCWEET_CT0='同一会话的 ct0 Cookie 值'
 export TARGET_ACCOUNT='WorkBuddy_AI'
 export DB_PATH='./monitor.db'
 export SCWEET_DB_PATH='./scweet_state.db'
@@ -81,6 +87,7 @@ export DRY_RUN='true'
 | 名称 | 类型 | 必填 | 说明 |
 |---|---|---|---|
 | `SCWEET_AUTH_TOKEN` | Secret | 是 | X 登录 Cookie 中的 `auth_token` 值 |
+| `SCWEET_CT0` | Secret | 否 | 仅当 Actions 初始化返回 403 时设置；需与 `SCWEET_AUTH_TOKEN` 来自同一登录会话 |
 | `WEBHOOK_URL` | Secret | 否 | 钉钉/企业微信/通用通知地址；不设置时命中内容会保留为待通知 |
 | `DINGTALK_SECRET` | Secret | 否 | 钉钉机器人加签密钥 |
 | `TARGET_ACCOUNT` | Variable | 否 | 要监控的账号，默认 `WorkBuddy_AI` |
@@ -97,6 +104,7 @@ export DRY_RUN='true'
 | 环境变量 | 默认值 | 说明 |
 |---|---:|---|
 | `SCWEET_AUTH_TOKEN` | 必填 | X 登录 Cookie 中的 `auth_token` |
+| `SCWEET_CT0` | 空 | 可选，X 首页初始化返回 403 时使用同一会话中的 `ct0` Cookie 跳过初始化 |
 | `TARGET_ACCOUNT` | `WorkBuddy_AI` | 不含 `@` 的目标账号名 |
 | `POLL_SECONDS` | `600` | 本机持续运行时的轮询间隔，最小 30 秒；Actions 使用 workflow 的 cron |
 | `INITIAL_HOURS` | `72` | 每轮至少回溯的小时数，用于覆盖最近 3 天、调度延迟和短暂失败 |

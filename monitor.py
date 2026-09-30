@@ -173,6 +173,7 @@ COMPILED_CATEGORY_TERMS = _compile_terms()
 @dataclass(frozen=True)
 class Settings:
     auth_token: str
+    csrf_token: str = ""
     account: str = DEFAULT_ACCOUNT
     db_path: str = DEFAULT_DB_PATH
     scweet_db_path: str = DEFAULT_SCWEET_DB_PATH
@@ -212,6 +213,7 @@ def load_settings() -> Settings:
 
     return Settings(
         auth_token=auth_token,
+        csrf_token=os.environ.get("SCWEET_CT0", "").strip(),
         account=os.environ.get("TARGET_ACCOUNT", DEFAULT_ACCOUNT).strip().lstrip("@"),
         db_path=os.environ.get("DB_PATH", DEFAULT_DB_PATH).strip(),
         scweet_db_path=os.environ.get("SCWEET_DB_PATH", DEFAULT_SCWEET_DB_PATH).strip(),
@@ -492,10 +494,17 @@ class ScweetClient:
             except ImportError as exc:
                 raise RuntimeError("未安装 Scweet；请执行 pip install -r requirements.txt") from exc
 
-            self.client = Scweet(
-                auth_token=self.settings.auth_token,
-                db_path=self.settings.scweet_db_path,
-            )
+            client_options: dict[str, Any] = {"db_path": self.settings.scweet_db_path}
+            if self.settings.csrf_token:
+                # Supplying both browser cookies skips the X homepage bootstrap, which
+                # can return 403 from hosted CI runner IPs even when the cookies work locally.
+                client_options["cookies"] = {
+                    "auth_token": self.settings.auth_token,
+                    "ct0": self.settings.csrf_token,
+                }
+            else:
+                client_options["auth_token"] = self.settings.auth_token
+            self.client = Scweet(**client_options)
 
         try:
             self._install_completion_check()

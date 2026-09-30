@@ -18,6 +18,7 @@ jobs:
     timeout-minutes: 5
     env:
       SCWEET_AUTH_TOKEN: ${{ secrets.SCWEET_AUTH_TOKEN }}
+      SCWEET_CT0: ${{ secrets.SCWEET_CT0 }}
       TARGET_ACCOUNT: ${{ vars.TARGET_ACCOUNT || 'WorkBuddy_AI' }}
       INITIAL_HOURS: ${{ vars.INITIAL_HOURS || '72' }}
       MAX_TWEETS_PER_FETCH: ${{ vars.MAX_TWEETS_PER_FETCH || '100' }}
