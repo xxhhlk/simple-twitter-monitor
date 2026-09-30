@@ -1,0 +1,658 @@
+#!/usr/bin/env python3
+"""Monitor @WorkBuddy_AI for free AI/model promotions and send alerts."""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import logging
+import os
+import re
+import sqlite3
+import sys
+import time
+from pathlib import Path
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
+from email.utils import parsedate_to_datetime
+from typing import Any, Iterable
+
+import requests
+
+LOG = logging.getLogger("workbuddy-free-monitor")
+
+DEFAULT_API_URL = "https://api.twitterapi.io/twitter/tweet/advanced_search"
+DEFAULT_ACCOUNT = "WorkBuddy_AI"
+DEFAULT_POLL_SECONDS = 600
+DEFAULT_INITIAL_HOURS = 24
+DEFAULT_DB_PATH = "monitor.db"
+DEFAULT_TIMEOUT_SECONDS = 30
+
+# Broad recall first. Classification is deliberately explainable and local.
+CATEGORY_TERMS: dict[str, tuple[str, ...]] = {
+    "免费领取/赠送额度": (
+        "free credits",
+        "free credit",
+        "free quota",
+        "free tokens",
+        "free token",
+        "free points",
+        r"free.{0,20}(credits?|tokens?|points?|quota)",
+        r"(claim|get|receive).{0,20}(free credits?|free tokens?|free points?|free quota)",
+        r"(free|赠送|送|免费领).{0,20}(credits?|tokens?|points?|quota|积分|额度)",
+        "免费额度",
+        "免费积分",
+        "赠送额度",
+        "送积分",
+        "送额度",
+        "领取积分",
+        "领取额度",
+        "免费 token",
+        "免费 tokens",
+        r"免费.{0,20}(积分|额度|token|tokens|credits?|quota)",
+    ),
+    "模型免费使用": (
+        "free model",
+        "free models",
+        "free access",
+        "use .* for free",
+        "try .* for free",
+        "available for free",
+        r"(model|模型).{0,20}(free|免费)",
+        r"(free|免费).{0,20}(model|模型)",
+        "免费模型",
+        "模型免费",
+        "免费使用",
+        "免费开放",
+        "免费体验",
+    ),
+    "限时免费/试用": (
+        "free trial",
+        "trial for free",
+        "extended trial",
+        "trial extended",
+        "limited[- ]time free",
+        "free for a limited time",
+        "free this week",
+        "free until",
+        "complimentary",
+        "giveaway",
+        r"free.{0,20}(today|this week|this month|until)",
+        r"(today|this week|this month|until).{0,20}free",
+        "免费试用",
+        "限时免费",
+        "限时开放",
+        "本周免费",
+        "限时体验",
+        "免费赠送",
+    ),
+    "免费延期/延长": (
+        "extended free",
+        "free period extended",
+        "free trial extended",
+        "extended .* free",
+        "free .* extended",
+        "extension of free",
+        "free extension",
+        r"(extend|extended|extension).{0,20}(free|trial)",
+        r"(free|trial).{0,20}(extend|extended|extension)",
+        "延期免费",
+        "免费延期",
+        "延长免费",
+        "免费期延长",
+        "试用期延长",
+    ),
+    "免费计划/升级": (
+        "free tier",
+        "free plan",
+        "free to use",
+        "free forever",
+        "forever free",
+        "free upgrade",
+        r"(free|免费).{0,20}(forever|永久)",
+        r"(forever|永久).{0,20}(free|免费)",
+        "免费套餐",
+        "免费计划",
+        "免费升级",
+        "永久免费",
+    ),
+    "开源/无费用": (
+        "open source",
+        "open-source",
+        "no cost",
+        "at no cost",
+        "without charge",
+        "free of charge",
+        "永久免费使用",
+        "免费开源",
+        "开源模型",
+    ),
+}
+
+# Terms that make a generic "free" mention more likely to be an offer.
+OFFER_TERMS = (
+    "free",
+    "免费",
+    "trial",
+    "试用",
+    "credit",
+    "quota",
+    "token",
+    "积分",
+    "额度",
+    "模型",
+    "model",
+    "open source",
+    "开源",
+    "giveaway",
+    "complimentary",
+    "forever",
+    "tier",
+    "plan",
+    "extension",
+    "extended",
+    "延期",
+    "延长",
+    "赠送",
+    "送",
+)
+
+
+def _compile_terms() -> dict[str, tuple[re.Pattern[str], ...]]:
+    compiled: dict[str, tuple[re.Pattern[str], ...]] = {}
+    for category, terms in CATEGORY_TERMS.items():
+        compiled[category] = tuple(re.compile(term, re.IGNORECASE) for term in terms)
+    return compiled
+
+
+COMPILED_CATEGORY_TERMS = _compile_terms()
+
+
+@dataclass(frozen=True)
+class Settings:
+    api_key: str
+    account: str = DEFAULT_ACCOUNT
+    db_path: str = DEFAULT_DB_PATH
+    poll_seconds: int = DEFAULT_POLL_SECONDS
+    initial_hours: int = DEFAULT_INITIAL_HOURS
+    webhook_url: str = ""
+    webhook_type: str = "generic"
+    api_url: str = DEFAULT_API_URL
+    request_timeout: int = DEFAULT_TIMEOUT_SECONDS
+    exclude_replies: bool = True
+    dry_run: bool = False
+
+
+def parse_bool(value: str | None, default: bool = False) -> bool:
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def load_settings() -> Settings:
+    api_key = os.environ.get("TWITTERAPI_IO_KEY", "").strip()
+    if not api_key:
+        raise ValueError("缺少 TWITTERAPI_IO_KEY 环境变量")
+
+    poll_seconds = int(os.environ.get("POLL_SECONDS", str(DEFAULT_POLL_SECONDS)))
+    initial_hours = int(os.environ.get("INITIAL_HOURS", str(DEFAULT_INITIAL_HOURS)))
+    request_timeout = int(os.environ.get("REQUEST_TIMEOUT", str(DEFAULT_TIMEOUT_SECONDS)))
+    if poll_seconds < 30:
+        raise ValueError("POLL_SECONDS 不能小于 30")
+    if initial_hours < 1:
+        raise ValueError("INITIAL_HOURS 不能小于 1")
+
+    return Settings(
+        api_key=api_key,
+        account=os.environ.get("TARGET_ACCOUNT", DEFAULT_ACCOUNT).strip().lstrip("@"),
+        db_path=os.environ.get("DB_PATH", DEFAULT_DB_PATH).strip(),
+        poll_seconds=poll_seconds,
+        initial_hours=initial_hours,
+        webhook_url=os.environ.get("WEBHOOK_URL", "").strip(),
+        webhook_type=os.environ.get("WEBHOOK_TYPE", "generic").strip().lower(),
+        api_url=os.environ.get("TWITTERAPI_IO_URL", DEFAULT_API_URL).strip(),
+        request_timeout=request_timeout,
+        exclude_replies=parse_bool(os.environ.get("EXCLUDE_REPLIES"), True),
+        dry_run=parse_bool(os.environ.get("DRY_RUN"), False),
+    )
+
+
+def utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def to_unix_seconds(value: datetime) -> int:
+    return int(value.astimezone(timezone.utc).timestamp())
+
+
+def build_query(account: str, since_time: datetime, until_time: datetime, exclude_replies: bool = True) -> str:
+    """Build the current TwitterAPI.io time-query syntax."""
+    parts = [
+        f"from:{account}",
+        f"since_time:{to_unix_seconds(since_time)}",
+        f"until_time:{to_unix_seconds(until_time)}",
+    ]
+    if exclude_replies:
+        parts.append("-is:reply")
+    return " ".join(parts)
+
+
+def normalize_text(tweet: dict[str, Any]) -> str:
+    text = tweet.get("text")
+    if isinstance(text, str):
+        return text.strip()
+    return ""
+
+
+def classify_free_activity(text: str) -> list[dict[str, str]]:
+    """Return all matching categories and exact trigger terms."""
+    if not text or not any(term in text.lower() for term in OFFER_TERMS):
+        return []
+
+    matches: list[dict[str, str]] = []
+    for category, patterns in COMPILED_CATEGORY_TERMS.items():
+        terms = [pattern.pattern for pattern in patterns if pattern.search(text)]
+        if terms:
+            matches.append({"category": category, "terms": terms})
+    return matches
+
+
+def tweet_id(tweet: dict[str, Any]) -> str:
+    value = tweet.get("id") or tweet.get("id_str")
+    return str(value).strip() if value is not None else ""
+
+
+def tweet_author(tweet: dict[str, Any], fallback: str) -> str:
+    author = tweet.get("author")
+    if isinstance(author, dict):
+        return str(author.get("userName") or author.get("username") or fallback)
+    if isinstance(author, str) and author:
+        return author
+    return fallback
+
+
+def tweet_created_at(tweet: dict[str, Any]) -> str:
+    value = tweet.get("createdAt") or tweet.get("created_at") or ""
+    return str(value)
+
+
+def tweet_url(tweet: dict[str, Any], account: str) -> str:
+    url = tweet.get("url")
+    if isinstance(url, str) and url:
+        return url
+    identifier = tweet_id(tweet)
+    return f"https://x.com/{account}/status/{identifier}" if identifier else ""
+
+
+def parse_created_at(value: str) -> datetime | None:
+    if not value:
+        return None
+    try:
+        return parsedate_to_datetime(value).astimezone(timezone.utc)
+    except (TypeError, ValueError, OverflowError):
+        pass
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00")).astimezone(timezone.utc)
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
+def format_time(value: str) -> str:
+    parsed = parse_created_at(value)
+    if not parsed:
+        return value or "未知时间"
+    beijing = parsed.astimezone(timezone(timedelta(hours=8)))
+    return beijing.strftime("%Y-%m-%d %H:%M:%S")
+
+
+class StateStore:
+    def __init__(self, path: str):
+        self.path = path
+        if path != ":memory:":
+            parent = Path(path).expanduser().resolve().parent
+            parent.mkdir(parents=True, exist_ok=True)
+        self.connection = sqlite3.connect(path)
+        self.connection.execute("PRAGMA journal_mode=WAL")
+        self.connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS tweets (
+                tweet_id TEXT PRIMARY KEY,
+                author TEXT NOT NULL,
+                created_at TEXT,
+                text TEXT NOT NULL,
+                tweet_url TEXT,
+                categories TEXT NOT NULL,
+                matched_terms TEXT NOT NULL,
+                notified INTEGER NOT NULL DEFAULT 0,
+                first_seen_at TEXT NOT NULL
+            )
+            """
+        )
+        self.connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS state (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            )
+            """
+        )
+        self.connection.commit()
+
+    def get_last_checked(self) -> datetime | None:
+        row = self.connection.execute("SELECT value FROM state WHERE key = 'last_checked'").fetchone()
+        if not row:
+            return None
+        try:
+            return datetime.fromisoformat(row[0]).astimezone(timezone.utc)
+        except ValueError:
+            LOG.warning("last_checked 无法解析，将重新建立检查窗口")
+            return None
+
+    def set_last_checked(self, value: datetime) -> None:
+        self.connection.execute(
+            "INSERT INTO state(key, value) VALUES('last_checked', ?) "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            (value.astimezone(timezone.utc).isoformat(),),
+        )
+        self.connection.commit()
+
+    def save_tweet(
+        self,
+        tweet: dict[str, Any],
+        account: str,
+        matches: list[dict[str, str]],
+    ) -> bool:
+        identifier = tweet_id(tweet)
+        if not identifier:
+            return False
+        categories = [item["category"] for item in matches]
+        terms = sorted({term for item in matches for term in item["terms"]})
+        try:
+            self.connection.execute(
+                """
+                INSERT INTO tweets(
+                    tweet_id, author, created_at, text, tweet_url,
+                    categories, matched_terms, notified, first_seen_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?)
+                """,
+                (
+                    identifier,
+                    tweet_author(tweet, account),
+                    tweet_created_at(tweet),
+                    normalize_text(tweet),
+                    tweet_url(tweet, account),
+                    json.dumps(categories, ensure_ascii=False),
+                    json.dumps(terms, ensure_ascii=False),
+                    utc_now().isoformat(),
+                ),
+            )
+            self.connection.commit()
+            return True
+        except sqlite3.IntegrityError:
+            return False
+
+    def is_notified(self, identifier: str) -> bool:
+        row = self.connection.execute(
+            "SELECT notified FROM tweets WHERE tweet_id = ?", (identifier,)
+        ).fetchone()
+        return bool(row and row[0])
+
+    def pending_tweets(self) -> list[dict[str, Any]]:
+        rows = self.connection.execute(
+            """
+            SELECT tweet_id, author, created_at, text, tweet_url, categories, matched_terms
+            FROM tweets
+            WHERE notified = 0 AND categories != '[]'
+            ORDER BY first_seen_at ASC
+            """
+        ).fetchall()
+        pending: list[dict[str, Any]] = []
+        for identifier, author, created_at, text, url, categories, terms in rows:
+            try:
+                parsed_categories = json.loads(categories)
+                parsed_terms = json.loads(terms)
+            except (TypeError, ValueError):
+                LOG.warning("跳过损坏的待通知记录: %s", identifier)
+                continue
+            pending.append(
+                {
+                    "id": identifier,
+                    "author": {"userName": author},
+                    "createdAt": created_at,
+                    "text": text,
+                    "url": url,
+                    "_categories": parsed_categories,
+                    "_terms": parsed_terms,
+                }
+            )
+        return pending
+
+    def mark_notified(self, identifier: str) -> None:
+        self.connection.execute("UPDATE tweets SET notified = 1 WHERE tweet_id = ?", (identifier,))
+        self.connection.commit()
+
+    def close(self) -> None:
+        self.connection.close()
+
+
+class TwitterApiClient:
+    def __init__(self, settings: Settings):
+        self.settings = settings
+        self.session = requests.Session()
+        self.session.headers.update({"X-API-Key": settings.api_key, "Accept": "application/json"})
+
+    def fetch(self, since_time: datetime, until_time: datetime) -> list[dict[str, Any]]:
+        query = build_query(
+            self.settings.account,
+            since_time,
+            until_time,
+            self.settings.exclude_replies,
+        )
+        params: dict[str, str] = {"query": query, "queryType": "Latest"}
+        tweets: list[dict[str, Any]] = []
+        cursor = ""
+        page_count = 0
+        while True:
+            page_count += 1
+            if page_count > 100:
+                raise RuntimeError("分页超过 100 页，主动停止以避免异常账单")
+            if cursor:
+                params["cursor"] = cursor
+            response = self.session.get(
+                self.settings.api_url,
+                params=params,
+                timeout=self.settings.request_timeout,
+            )
+            if response.status_code == 429:
+                raise RuntimeError(f"TwitterAPI.io 返回 429 限流: {response.text[:300]}")
+            if response.status_code >= 400:
+                raise RuntimeError(f"TwitterAPI.io 返回 HTTP {response.status_code}: {response.text[:500]}")
+            try:
+                payload = response.json()
+            except ValueError as exc:
+                raise RuntimeError("TwitterAPI.io 返回了无法解析的 JSON") from exc
+            page = payload.get("tweets", [])
+            if not isinstance(page, list):
+                raise RuntimeError("TwitterAPI.io 响应中的 tweets 不是数组")
+            tweets.extend(item for item in page if isinstance(item, dict))
+            if not payload.get("has_next_page") or not payload.get("next_cursor"):
+                break
+            cursor = str(payload["next_cursor"])
+        return tweets
+
+
+class Notifier:
+    def __init__(self, settings: Settings):
+        self.settings = settings
+
+    @staticmethod
+    def _sign_dingtalk(url: str, secret: str) -> str:
+        import base64
+        import hmac
+        import urllib.parse
+
+        timestamp = str(int(time.time() * 1000))
+        sign_text = f"{timestamp}\n{secret}"
+        digest = hmac.new(secret.encode(), sign_text.encode(), hashlib.sha256).digest()
+        sign = urllib.parse.quote_plus(base64.b64encode(digest))
+        separator = "&" if "?" in url else "?"
+        return f"{url}{separator}timestamp={timestamp}&sign={sign}"
+
+    def send(
+        self,
+        tweet: dict[str, Any],
+        matches: list[dict[str, str]],
+        account: str,
+    ) -> bool:
+        if not self.settings.webhook_url:
+            LOG.warning("未配置 WEBHOOK_URL，命中内容保留为待通知状态")
+            return False
+
+        text = normalize_text(tweet)
+        author = tweet_author(tweet, account)
+        url = tweet_url(tweet, account)
+        categories = [item["category"] for item in matches]
+        terms = sorted({term for item in matches for term in item["terms"]})
+        content = (
+            f"【WorkBuddy_AI 免费活动】\n"
+            f"账号：@{author}\n"
+            f"时间：{format_time(tweet_created_at(tweet))}\n"
+            f"类型：{'、'.join(categories)}\n"
+            f"命中：{', '.join(terms)}\n\n"
+            f"{text}\n\n"
+            f"链接：{url}"
+        )
+        if self.settings.webhook_type == "dingtalk":
+            secret = os.environ.get("DINGTALK_SECRET", "")
+            target_url = self._sign_dingtalk(self.settings.webhook_url, secret) if secret else self.settings.webhook_url
+            payload = {
+                "msgtype": "markdown",
+                "markdown": {"title": "WorkBuddy_AI 免费活动", "text": content.replace("\n", "  \n")},
+                "at": {"isAtAll": False},
+            }
+        elif self.settings.webhook_type == "wecom":
+            target_url = self.settings.webhook_url
+            payload = {"msgtype": "text", "text": {"content": content}}
+        else:
+            target_url = self.settings.webhook_url
+            payload = {"text": content, "content": content, "tweet": tweet, "matches": matches}
+
+        response = requests.post(target_url, json=payload, timeout=self.settings.request_timeout)
+        if response.status_code >= 400:
+            raise RuntimeError(f"通知 Webhook 返回 HTTP {response.status_code}: {response.text[:500]}")
+        LOG.info("已发送通知: %s", url)
+        return True
+
+
+def _retry_pending_notifications(
+    settings: Settings,
+    store: StateStore,
+    notifier: Notifier,
+) -> int:
+    """Retry records saved before a webhook failure or process restart."""
+    retried = 0
+    for tweet in store.pending_tweets():
+        identifier = tweet["id"]
+        categories = tweet.pop("_categories", [])
+        terms = tweet.pop("_terms", [])
+        matches = [{"category": category, "terms": terms} for category in categories]
+        if settings.dry_run:
+            LOG.info("DRY_RUN=1，跳过待通知记录: %s", tweet_url(tweet, settings.account))
+            continue
+        if notifier.send(tweet, matches, settings.account):
+            store.mark_notified(identifier)
+            retried += 1
+    return retried
+
+
+def process_once(settings: Settings, store: StateStore, client: TwitterApiClient, notifier: Notifier) -> int:
+    until_time = utc_now()
+    retried_count = _retry_pending_notifications(settings, store, notifier)
+    since_time = store.get_last_checked() or (until_time - timedelta(hours=settings.initial_hours))
+    if since_time >= until_time:
+        since_time = until_time - timedelta(seconds=1)
+
+    LOG.info("检查 @%s: %s - %s", settings.account, since_time.isoformat(), until_time.isoformat())
+    tweets = client.fetch(since_time, until_time)
+    # Newest first is returned by Latest, but sort defensively before notification.
+    tweets.sort(key=lambda item: tweet_created_at(item))
+    matched_count = retried_count
+    for tweet in tweets:
+        identifier = tweet_id(tweet)
+        text = normalize_text(tweet)
+        matches = classify_free_activity(text)
+        if not store.save_tweet(tweet, settings.account, matches):
+            continue
+        if not matches:
+            continue
+        matched_count += 1
+        author = tweet_author(tweet, settings.account)
+        LOG.info("命中免费活动 [%s] @%s: %s", ", ".join(item["category"] for item in matches), author, text[:160])
+        if settings.dry_run:
+            LOG.info("DRY_RUN=1，跳过发送: %s", tweet_url(tweet, settings.account))
+            continue
+        if notifier.send(tweet, matches, settings.account):
+            store.mark_notified(identifier)
+
+    # Advance only after the complete page set has been processed.
+    store.set_last_checked(until_time)
+    LOG.info("本轮获取 %d 条，命中/补发 %d 条", len(tweets), matched_count)
+    return matched_count
+
+
+def run(settings: Settings) -> None:
+    logging.basicConfig(
+        level=os.environ.get("LOG_LEVEL", "INFO").upper(),
+        format="%(asctime)s %(levelname)s %(message)s",
+    )
+    store = StateStore(settings.db_path)
+    client = TwitterApiClient(settings)
+    notifier = Notifier(settings)
+    try:
+        while True:
+            started = time.monotonic()
+            try:
+                process_once(settings, store, client, notifier)
+            except Exception:
+                LOG.exception("本轮检查失败；保留上次游标，下一轮将重试")
+            elapsed = time.monotonic() - started
+            wait_seconds = max(1, settings.poll_seconds - int(elapsed))
+            LOG.info("等待 %d 秒后检查", wait_seconds)
+            time.sleep(wait_seconds)
+    except KeyboardInterrupt:
+        LOG.info("监控已停止")
+    finally:
+        store.close()
+
+
+def main(argv: Iterable[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description="监控 @WorkBuddy_AI 的免费 AI 活动")
+    parser.add_argument("--once", action="store_true", help="只执行一轮检查")
+    args = parser.parse_args(list(argv) if argv is not None else None)
+    try:
+        settings = load_settings()
+    except (ValueError, OSError) as exc:
+        print(f"配置错误: {exc}", file=sys.stderr)
+        return 2
+
+    logging.basicConfig(
+        level=os.environ.get("LOG_LEVEL", "INFO").upper(),
+        format="%(asctime)s %(levelname)s %(message)s",
+    )
+    if args.once:
+        store = StateStore(settings.db_path)
+        try:
+            process_once(settings, store, TwitterApiClient(settings), Notifier(settings))
+        except Exception:
+            LOG.exception("单轮检查失败")
+            return 1
+        finally:
+            store.close()
+        return 0
+    run(settings)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
