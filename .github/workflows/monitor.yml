@@ -17,9 +17,10 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     env:
-      TWITTERAPI_IO_KEY: ${{ secrets.TWITTERAPI_IO_KEY }}
+      SCWEET_AUTH_TOKEN: ${{ secrets.SCWEET_AUTH_TOKEN }}
       TARGET_ACCOUNT: ${{ vars.TARGET_ACCOUNT || 'WorkBuddy_AI' }}
       INITIAL_HOURS: ${{ vars.INITIAL_HOURS || '24' }}
+      MAX_TWEETS_PER_FETCH: ${{ vars.MAX_TWEETS_PER_FETCH || '100' }}
       DB_PATH: monitor.db
       EXCLUDE_REPLIES: ${{ vars.EXCLUDE_REPLIES || 'true' }}
       WEBHOOK_TYPE: ${{ vars.WEBHOOK_TYPE || 'dingtalk' }}
@@ -49,3 +50,5 @@ jobs:
 
       - name: Run one monitoring cycle
         run: python monitor.py --once
+        env:
+          SCWEET_DB_PATH: ${{ runner.temp }}/scweet-state.db

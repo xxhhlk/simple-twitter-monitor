@@ -22,11 +22,12 @@ import requests
 
 LOG = logging.getLogger("workbuddy-free-monitor")
 
-DEFAULT_API_URL = "https://api.twitterapi.io/twitter/tweet/advanced_search"
 DEFAULT_ACCOUNT = "WorkBuddy_AI"
 DEFAULT_POLL_SECONDS = 600
 DEFAULT_INITIAL_HOURS = 24
 DEFAULT_DB_PATH = "monitor.db"
+DEFAULT_SCWEET_DB_PATH = "scweet_state.db"
+DEFAULT_MAX_TWEETS_PER_FETCH = 100
 DEFAULT_TIMEOUT_SECONDS = 30
 
 # Broad recall first. Classification is deliberately explainable and local.
@@ -171,14 +172,15 @@ COMPILED_CATEGORY_TERMS = _compile_terms()
 
 @dataclass(frozen=True)
 class Settings:
-    api_key: str
+    auth_token: str
     account: str = DEFAULT_ACCOUNT
     db_path: str = DEFAULT_DB_PATH
+    scweet_db_path: str = DEFAULT_SCWEET_DB_PATH
     poll_seconds: int = DEFAULT_POLL_SECONDS
     initial_hours: int = DEFAULT_INITIAL_HOURS
+    max_tweets_per_fetch: int = DEFAULT_MAX_TWEETS_PER_FETCH
     webhook_url: str = ""
     webhook_type: str = "generic"
-    api_url: str = DEFAULT_API_URL
     request_timeout: int = DEFAULT_TIMEOUT_SECONDS
     exclude_replies: bool = True
     dry_run: bool = False
@@ -191,27 +193,33 @@ def parse_bool(value: str | None, default: bool = False) -> bool:
 
 
 def load_settings() -> Settings:
-    api_key = os.environ.get("TWITTERAPI_IO_KEY", "").strip()
-    if not api_key:
-        raise ValueError("缺少 TWITTERAPI_IO_KEY 环境变量")
+    auth_token = os.environ.get("SCWEET_AUTH_TOKEN", "").strip()
+    if not auth_token:
+        raise ValueError("缺少 SCWEET_AUTH_TOKEN 环境变量（X 账号的 auth_token Cookie）")
 
     poll_seconds = int(os.environ.get("POLL_SECONDS", str(DEFAULT_POLL_SECONDS)))
     initial_hours = int(os.environ.get("INITIAL_HOURS", str(DEFAULT_INITIAL_HOURS)))
+    max_tweets_per_fetch = int(
+        os.environ.get("MAX_TWEETS_PER_FETCH", str(DEFAULT_MAX_TWEETS_PER_FETCH))
+    )
     request_timeout = int(os.environ.get("REQUEST_TIMEOUT", str(DEFAULT_TIMEOUT_SECONDS)))
     if poll_seconds < 30:
         raise ValueError("POLL_SECONDS 不能小于 30")
     if initial_hours < 1:
         raise ValueError("INITIAL_HOURS 不能小于 1")
+    if max_tweets_per_fetch < 1:
+        raise ValueError("MAX_TWEETS_PER_FETCH 不能小于 1")
 
     return Settings(
-        api_key=api_key,
+        auth_token=auth_token,
         account=os.environ.get("TARGET_ACCOUNT", DEFAULT_ACCOUNT).strip().lstrip("@"),
         db_path=os.environ.get("DB_PATH", DEFAULT_DB_PATH).strip(),
+        scweet_db_path=os.environ.get("SCWEET_DB_PATH", DEFAULT_SCWEET_DB_PATH).strip(),
         poll_seconds=poll_seconds,
         initial_hours=initial_hours,
+        max_tweets_per_fetch=max_tweets_per_fetch,
         webhook_url=os.environ.get("WEBHOOK_URL", "").strip(),
         webhook_type=os.environ.get("WEBHOOK_TYPE", "generic").strip().lower(),
-        api_url=os.environ.get("TWITTERAPI_IO_URL", DEFAULT_API_URL).strip(),
         request_timeout=request_timeout,
         exclude_replies=parse_bool(os.environ.get("EXCLUDE_REPLIES"), True),
         dry_run=parse_bool(os.environ.get("DRY_RUN"), False),
@@ -227,7 +235,7 @@ def to_unix_seconds(value: datetime) -> int:
 
 
 def build_query(account: str, since_time: datetime, until_time: datetime, exclude_replies: bool = True) -> str:
-    """Build the current TwitterAPI.io time-query syntax."""
+    """Build the legacy query syntax for callers that still import this helper."""
     parts = [
         f"from:{account}",
         f"since_time:{to_unix_seconds(since_time)}",
@@ -259,26 +267,31 @@ def classify_free_activity(text: str) -> list[dict[str, str]]:
 
 
 def tweet_id(tweet: dict[str, Any]) -> str:
-    value = tweet.get("id") or tweet.get("id_str")
+    value = tweet.get("id") or tweet.get("id_str") or tweet.get("tweet_id")
     return str(value).strip() if value is not None else ""
 
 
 def tweet_author(tweet: dict[str, Any], fallback: str) -> str:
-    author = tweet.get("author")
+    author = tweet.get("author") or tweet.get("user")
     if isinstance(author, dict):
-        return str(author.get("userName") or author.get("username") or fallback)
+        return str(
+            author.get("userName")
+            or author.get("username")
+            or author.get("screen_name")
+            or fallback
+        )
     if isinstance(author, str) and author:
         return author
     return fallback
 
 
 def tweet_created_at(tweet: dict[str, Any]) -> str:
-    value = tweet.get("createdAt") or tweet.get("created_at") or ""
+    value = tweet.get("createdAt") or tweet.get("created_at") or tweet.get("timestamp") or ""
     return str(value)
 
 
 def tweet_url(tweet: dict[str, Any], account: str) -> str:
-    url = tweet.get("url")
+    url = tweet.get("url") or tweet.get("tweet_url")
     if isinstance(url, str) and url:
         return url
     identifier = tweet_id(tweet)
@@ -436,49 +449,44 @@ class StateStore:
         self.connection.close()
 
 
-class TwitterApiClient:
+class ScweetClient:
     def __init__(self, settings: Settings):
         self.settings = settings
-        self.session = requests.Session()
-        self.session.headers.update({"X-API-Key": settings.api_key, "Accept": "application/json"})
+        self.client: Any | None = None
 
     def fetch(self, since_time: datetime, until_time: datetime) -> list[dict[str, Any]]:
-        query = build_query(
-            self.settings.account,
-            since_time,
-            until_time,
-            self.settings.exclude_replies,
-        )
-        params: dict[str, str] = {"query": query, "queryType": "Latest"}
-        tweets: list[dict[str, Any]] = []
-        cursor = ""
-        page_count = 0
-        while True:
-            page_count += 1
-            if page_count > 100:
-                raise RuntimeError("分页超过 100 页，主动停止以避免异常账单")
-            if cursor:
-                params["cursor"] = cursor
-            response = self.session.get(
-                self.settings.api_url,
-                params=params,
-                timeout=self.settings.request_timeout,
-            )
-            if response.status_code == 429:
-                raise RuntimeError(f"TwitterAPI.io 返回 429 限流: {response.text[:300]}")
-            if response.status_code >= 400:
-                raise RuntimeError(f"TwitterAPI.io 返回 HTTP {response.status_code}: {response.text[:500]}")
+        if self.client is None:
             try:
-                payload = response.json()
-            except ValueError as exc:
-                raise RuntimeError("TwitterAPI.io 返回了无法解析的 JSON") from exc
-            page = payload.get("tweets", [])
-            if not isinstance(page, list):
-                raise RuntimeError("TwitterAPI.io 响应中的 tweets 不是数组")
-            tweets.extend(item for item in page if isinstance(item, dict))
-            if not payload.get("has_next_page") or not payload.get("next_cursor"):
-                break
-            cursor = str(payload["next_cursor"])
+                from Scweet import Scweet
+            except ImportError as exc:
+                raise RuntimeError("未安装 Scweet；请执行 pip install -r requirements.txt") from exc
+
+            self.client = Scweet(
+                auth_token=self.settings.auth_token,
+                db_path=self.settings.scweet_db_path,
+            )
+
+        try:
+            rows = self.client.get_profile_tweets(
+                [self.settings.account],
+                limit=self.settings.max_tweets_per_fetch,
+                include_replies=not self.settings.exclude_replies,
+            )
+        except Exception as exc:
+            raise RuntimeError(f"Scweet 获取 @{self.settings.account} 时间线失败: {exc}") from exc
+
+        if not isinstance(rows, list):
+            raise RuntimeError("Scweet 返回的时间线不是列表")
+
+        tweets: list[dict[str, Any]] = []
+        for tweet in rows:
+            if not isinstance(tweet, dict):
+                raise RuntimeError("Scweet 返回了无法识别的推文记录")
+            created_at = parse_created_at(tweet_created_at(tweet))
+            if created_at is None:
+                raise RuntimeError("Scweet 返回的推文缺少可解析的发布时间；本轮游标不会前移")
+            if since_time <= created_at <= until_time:
+                tweets.append(tweet)
         return tweets
 
 
@@ -566,7 +574,7 @@ def _retry_pending_notifications(
     return retried
 
 
-def process_once(settings: Settings, store: StateStore, client: TwitterApiClient, notifier: Notifier) -> int:
+def process_once(settings: Settings, store: StateStore, client: ScweetClient, notifier: Notifier) -> int:
     until_time = utc_now()
     retried_count = _retry_pending_notifications(settings, store, notifier)
     since_time = store.get_last_checked() or (until_time - timedelta(hours=settings.initial_hours))
@@ -575,8 +583,11 @@ def process_once(settings: Settings, store: StateStore, client: TwitterApiClient
 
     LOG.info("检查 @%s: %s - %s", settings.account, since_time.isoformat(), until_time.isoformat())
     tweets = client.fetch(since_time, until_time)
-    # Newest first is returned by Latest, but sort defensively before notification.
-    tweets.sort(key=lambda item: tweet_created_at(item))
+    # Notify chronologically even if the upstream timeline order changes.
+    tweets.sort(
+        key=lambda item: parse_created_at(tweet_created_at(item))
+        or datetime.min.replace(tzinfo=timezone.utc)
+    )
     matched_count = retried_count
     for tweet in tweets:
         identifier = tweet_id(tweet)
@@ -607,7 +618,7 @@ def run(settings: Settings) -> None:
         format="%(asctime)s %(levelname)s %(message)s",
     )
     store = StateStore(settings.db_path)
-    client = TwitterApiClient(settings)
+    client = ScweetClient(settings)
     notifier = Notifier(settings)
     try:
         while True:
@@ -643,7 +654,7 @@ def main(argv: Iterable[str] | None = None) -> int:
     if args.once:
         store = StateStore(settings.db_path)
         try:
-            process_once(settings, store, TwitterApiClient(settings), Notifier(settings))
+            process_once(settings, store, ScweetClient(settings), Notifier(settings))
         except Exception:
             LOG.exception("单轮检查失败")
             return 1
