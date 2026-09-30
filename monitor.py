@@ -453,6 +453,31 @@ class ScweetClient:
     def __init__(self, settings: Settings):
         self.settings = settings
         self.client: Any | None = None
+        self._completion_check_installed = False
+
+    def _install_completion_check(self) -> None:
+        """Restore Scweet's run status that get_profile_tweets drops from its return value."""
+        if self._completion_check_installed:
+            return
+
+        runner = getattr(self.client, "_runner", None)
+        run_profile_tweets = getattr(runner, "run_profile_tweets", None)
+        if not callable(run_profile_tweets):
+            raise RuntimeError("当前 Scweet 版本无法确认时间线抓取是否完整")
+
+        async def run_and_validate(*args: Any, **kwargs: Any) -> Any:
+            response = await run_profile_tweets(*args, **kwargs)
+            if not isinstance(response, dict) or response.get("completed") is not True:
+                completed = response.get("completed") if isinstance(response, dict) else None
+                limit_reached = response.get("limit_reached") if isinstance(response, dict) else None
+                raise RuntimeError(
+                    "Scweet 时间线抓取未完成 "
+                    f"(completed={completed!r}, limit_reached={limit_reached!r})"
+                )
+            return response
+
+        runner.run_profile_tweets = run_and_validate
+        self._completion_check_installed = True
 
     def fetch(self, since_time: datetime, until_time: datetime) -> list[dict[str, Any]]:
         if self.client is None:
@@ -467,6 +492,7 @@ class ScweetClient:
             )
 
         try:
+            self._install_completion_check()
             rows = self.client.get_profile_tweets(
                 [self.settings.account],
                 limit=self.settings.max_tweets_per_fetch,
@@ -577,7 +603,11 @@ def _retry_pending_notifications(
 def process_once(settings: Settings, store: StateStore, client: ScweetClient, notifier: Notifier) -> int:
     until_time = utc_now()
     retried_count = _retry_pending_notifications(settings, store, notifier)
-    since_time = store.get_last_checked() or (until_time - timedelta(hours=settings.initial_hours))
+    last_checked = store.get_last_checked()
+    minimum_since = until_time - timedelta(hours=settings.initial_hours)
+    # The overlap catches tweets if a scheduled run was delayed or an earlier
+    # version advanced the cursor after an incomplete upstream response.
+    since_time = min(last_checked, minimum_since) if last_checked else minimum_since
     if since_time >= until_time:
         since_time = until_time - timedelta(seconds=1)
 

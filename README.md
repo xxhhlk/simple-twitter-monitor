@@ -84,13 +84,13 @@ export DRY_RUN='true'
 | `WEBHOOK_URL` | Secret | 否 | 钉钉/企业微信/通用通知地址；不设置时命中内容会保留为待通知 |
 | `DINGTALK_SECRET` | Secret | 否 | 钉钉机器人加签密钥 |
 | `TARGET_ACCOUNT` | Variable | 否 | 要监控的账号，默认 `WorkBuddy_AI` |
-| `INITIAL_HOURS` | Variable | 否 | 首次运行回溯小时数，默认 `24` |
+| `INITIAL_HOURS` | Variable | 否 | 每轮至少回溯小时数，默认 `24` |
 | `MAX_TWEETS_PER_FETCH` | Variable | 否 | 每轮最多读取的推文数，默认 `100` |
 | `EXCLUDE_REPLIES` | Variable | 否 | 是否排除回复，默认 `true` |
 | `WEBHOOK_TYPE` | Variable | 否 | `dingtalk`、`wecom` 或 `generic`，默认 `dingtalk` |
 | `DRY_RUN` | Variable | 否 | `true` 时只抓取和记录、不发送；默认 `false` |
 
-`monitor.db` 会通过 GitHub Actions cache 在不同运行之间恢复，保存去重记录和检查游标。Scweet 自己的 SQLite 状态文件放在 runner 临时目录，不进入缓存；X 凭据只从 Secret 注入。首次运行没有缓存时会检查最近 24 小时；清除缓存后也可能重新检查这段时间，数据库去重无法避免已丢失状态后的重复通知。
+`monitor.db` 会通过 GitHub Actions cache 在不同运行之间恢复，保存去重记录和检查游标。Scweet 自己的 SQLite 状态文件放在 runner 临时目录，不进入缓存；X 凭据只从 Secret 注入。每轮至少回看最近 `INITIAL_HOURS` 小时；如果游标更早，则从游标处补查。这个重叠窗口可以弥补定时任务延迟或短暂失败，重复推文由 SQLite 去重。清除缓存后仍可能重复通知。
 
 ## 5. 配置参数
 
@@ -99,7 +99,7 @@ export DRY_RUN='true'
 | `SCWEET_AUTH_TOKEN` | 必填 | X 登录 Cookie 中的 `auth_token` |
 | `TARGET_ACCOUNT` | `WorkBuddy_AI` | 不含 `@` 的目标账号名 |
 | `POLL_SECONDS` | `600` | 本机持续运行时的轮询间隔，最小 30 秒；Actions 使用 workflow 的 cron |
-| `INITIAL_HOURS` | `24` | 首次启动时回溯的小时数 |
+| `INITIAL_HOURS` | `24` | 每轮至少回溯的小时数，用于覆盖调度延迟和短暂失败 |
 | `MAX_TWEETS_PER_FETCH` | `100` | 每轮最多读取的推文数；如监控间隔较长或账号发帖较多，可调大 |
 | `DB_PATH` | `monitor.db` | 去重记录、检查游标和待通知内容 |
 | `SCWEET_DB_PATH` | `scweet_state.db` | Scweet 内部状态库；其中可能保存认证状态，不要公开或上传 |
