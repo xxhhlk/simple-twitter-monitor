@@ -100,7 +100,7 @@ export DRY_RUN='true'
 | `TARGET_ACCOUNT` | `WorkBuddy_AI` | 不含 `@` 的目标账号名 |
 | `POLL_SECONDS` | `600` | 本机持续运行时的轮询间隔，最小 30 秒；Actions 使用 workflow 的 cron |
 | `INITIAL_HOURS` | `24` | 每轮至少回溯的小时数，用于覆盖调度延迟和短暂失败 |
-| `MAX_TWEETS_PER_FETCH` | `100` | 每轮最多读取的推文数；如监控间隔较长或账号发帖较多，可调大 |
+| `MAX_TWEETS_PER_FETCH` | `100` | 每轮最多读取的推文数；如账号在回查窗口内发帖较多，可调大。达到上限时，程序会确认最早推文已覆盖窗口起点，否则本轮失败并提示提高上限 |
 | `DB_PATH` | `monitor.db` | 去重记录、检查游标和待通知内容 |
 | `SCWEET_DB_PATH` | `scweet_state.db` | Scweet 内部状态库；其中可能保存认证状态，不要公开或上传 |
 | `EXCLUDE_REPLIES` | `true` | 是否排除回复推文 |

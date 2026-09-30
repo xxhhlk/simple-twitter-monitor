@@ -454,6 +454,7 @@ class ScweetClient:
         self.settings = settings
         self.client: Any | None = None
         self._completion_check_installed = False
+        self._run_status: dict[str, bool] | None = None
 
     def _install_completion_check(self) -> None:
         """Restore Scweet's run status that get_profile_tweets drops from its return value."""
@@ -467,12 +468,17 @@ class ScweetClient:
 
         async def run_and_validate(*args: Any, **kwargs: Any) -> Any:
             response = await run_profile_tweets(*args, **kwargs)
-            if not isinstance(response, dict) or response.get("completed") is not True:
-                completed = response.get("completed") if isinstance(response, dict) else None
-                limit_reached = response.get("limit_reached") if isinstance(response, dict) else None
+            if not isinstance(response, dict):
+                raise RuntimeError("Scweet 未返回时间线抓取状态")
+
+            completed = response.get("completed") is True
+            limit_reached = response.get("limit_reached") is True
+            self._run_status = {"completed": completed, "limit_reached": limit_reached}
+            if not completed and not limit_reached:
                 raise RuntimeError(
                     "Scweet 时间线抓取未完成 "
-                    f"(completed={completed!r}, limit_reached={limit_reached!r})"
+                    f"(completed={response.get('completed')!r}, "
+                    f"limit_reached={response.get('limit_reached')!r})"
                 )
             return response
 
@@ -493,6 +499,7 @@ class ScweetClient:
 
         try:
             self._install_completion_check()
+            self._run_status = None
             rows = self.client.get_profile_tweets(
                 [self.settings.account],
                 limit=self.settings.max_tweets_per_fetch,
@@ -504,16 +511,39 @@ class ScweetClient:
         if not isinstance(rows, list):
             raise RuntimeError("Scweet 返回的时间线不是列表")
 
-        tweets: list[dict[str, Any]] = []
+        parsed_tweets: list[tuple[datetime, dict[str, Any]]] = []
         for tweet in rows:
             if not isinstance(tweet, dict):
                 raise RuntimeError("Scweet 返回了无法识别的推文记录")
             created_at = parse_created_at(tweet_created_at(tweet))
             if created_at is None:
                 raise RuntimeError("Scweet 返回的推文缺少可解析的发布时间；本轮游标不会前移")
-            if since_time <= created_at <= until_time:
-                tweets.append(tweet)
-        return tweets
+            parsed_tweets.append((created_at, tweet))
+
+        status = self._run_status
+        if status is None:
+            raise RuntimeError("Scweet 未提供时间线抓取状态；本轮游标不会前移")
+        if status["limit_reached"]:
+            oldest_tweet_at = min((created_at for created_at, _ in parsed_tweets), default=None)
+            if oldest_tweet_at is None or oldest_tweet_at > since_time:
+                oldest_text = oldest_tweet_at.isoformat() if oldest_tweet_at else "无推文"
+                raise RuntimeError(
+                    f"Scweet 达到每轮上限 {self.settings.max_tweets_per_fetch} 条，"
+                    f"最早推文时间 {oldest_text} 晚于检查起点 {since_time.isoformat()}；"
+                    "可能遗漏窗口内推文，请调高 MAX_TWEETS_PER_FETCH 后重试"
+                )
+            LOG.warning(
+                "Scweet 达到每轮上限 %d 条，但已覆盖检查起点；继续处理本轮窗口",
+                self.settings.max_tweets_per_fetch,
+            )
+        elif not status["completed"]:
+            raise RuntimeError("Scweet 时间线抓取未完整结束；本轮游标不会前移")
+
+        return [
+            tweet
+            for created_at, tweet in parsed_tweets
+            if since_time <= created_at <= until_time
+        ]
 
 
 class Notifier:
