@@ -1,0 +1,10 @@
+[Unit]
+Description=Run WorkBuddy X activity monitor once a day
+
+[Timer]
+OnCalendar=*-*-* 00:00:00 UTC
+Persistent=true
+Unit=workbuddy-monitor.service
+
+[Install]
+WantedBy=timers.target

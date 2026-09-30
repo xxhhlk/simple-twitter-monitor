@@ -1,0 +1,23 @@
+[Unit]
+Description=WorkBuddy X activity monitor (one run)
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=workbuddy-monitor
+Group=workbuddy-monitor
+WorkingDirectory=/opt/simple-twitter-monitor
+EnvironmentFile=/etc/workbuddy-monitor.env
+Environment=DB_PATH=/var/lib/workbuddy-monitor/monitor.db
+Environment=SCWEET_DB_PATH=/var/lib/workbuddy-monitor/scweet_state.db
+StateDirectory=workbuddy-monitor
+StateDirectoryMode=0700
+UMask=0077
+ExecStart=/opt/simple-twitter-monitor/.venv/bin/python /opt/simple-twitter-monitor/monitor.py --once
+TimeoutStartSec=10min
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
