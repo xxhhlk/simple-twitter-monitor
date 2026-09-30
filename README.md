@@ -74,7 +74,7 @@ export DRY_RUN='true'
 
 ## 4. 在 GitHub Actions 上运行
 
-仓库中的 `.github/workflows/monitor.yml` 默认每 10 分钟运行一次，也可以在 GitHub 仓库的 **Actions** 页面手动启动 `WorkBuddy free activity monitor`。定时任务使用 UTC，且 workflow 需要先推送到默认分支才会生效；GitHub 的定时任务可能延迟启动。
+仓库中的 `.github/workflows/monitor.yml` 默认每天运行一次（UTC 00:00，即北京时间 08:00），也可以在 GitHub 仓库的 **Actions** 页面手动启动 `WorkBuddy free activity monitor`。定时任务使用 UTC，且 workflow 需要先推送到默认分支才会生效；GitHub 的定时任务可能延迟启动。
 
 在仓库 **Settings → Secrets and variables → Actions** 中设置：
 
