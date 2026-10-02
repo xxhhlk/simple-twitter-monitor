@@ -24,7 +24,7 @@ Linux/macOS：
 
 ## 2. 配置抓取凭据
 
-Scweet 使用 X 登录 Cookie 中的 `auth_token`。它相当于账号凭据：建议使用专门用于监控的 X 账号，并只把 Cookie 放在本机环境变量或 VPS 上权限为 `0600` 的环境文件中。不要写进代码、提交到仓库、发到聊天里或放进截图。X 的接口和非官方客户端可能变化，Cookie 也可能过期或触发 X 的风控。
+Scweet 使用 X 登录 Cookie 中的 `auth_token`。它相当于账号凭据：建议使用专门用于监控的 X 账号，并只把 Cookie 放在 `.env` 或 VPS 上权限受限的配置文件中。不要写进代码、提交到仓库、发到聊天里或放进截图。X 的接口和非官方客户端可能变化，Cookie 也可能过期或触发 X 的风控。
 
 如果运行环境的日志显示 `Auth bootstrap ... response_status=403`，可以额外设置同一浏览器登录会话中的 `ct0` Cookie 为 `SCWEET_CT0`。程序会直接导入 `auth_token` 和 `ct0`，跳过 X 首页的认证初始化。两项 Cookie 都是敏感凭据；此方式只能跳过首页初始化，不能解决后续 X API 请求也被拒绝的情况。
 
@@ -60,7 +60,19 @@ export DINGTALK_SECRET='钉钉机器人加签密钥'
 export DRY_RUN='true'
 ```
 
-`.env.example` 列出了全部常用配置；程序直接读取环境变量，不会自动加载 `.env` 文件。
+程序会自动读取与 `monitor.py` 同目录的 `.env` 文件，`.env.example` 是可复制的模板。已有的系统环境变量优先于 `.env` 中的同名配置；真实 `.env` 已加入 `.gitignore`，不会被 Git 跟踪。
+
+本机可复制模板后填写：
+
+```bash
+cp .env.example .env
+```
+
+Windows PowerShell：
+
+```powershell
+Copy-Item .env.example .env
+```
 
 `WEBHOOK_TYPE` 支持：
 
@@ -80,7 +92,7 @@ export DRY_RUN='true'
 
 ## 4. 部署到 VPS（Ubuntu/Debian）
 
-服务以无登录权限的 `workbuddy-monitor` 系统用户运行；代码放在 `/opt/simple-twitter-monitor`，SQLite 状态放在 `/var/lib/workbuddy-monitor`，凭据单独放在 root 所有、权限为 `0600` 的环境文件。定时器默认每天 UTC 00:00 运行一次（北京时间 08:00）；若 VPS 关机错过一次，systemd 会在下次启动时补跑。
+服务以无登录权限的 `workbuddy-monitor` 系统用户运行；代码和 `.env` 放在 `/opt/simple-twitter-monitor`，SQLite 状态放在 `/var/lib/workbuddy-monitor`。定时器默认每天 UTC 00:00 运行一次（北京时间 08:00）；若 VPS 关机错过一次，systemd 会在下次启动时补跑。
 
 先安装依赖、创建系统用户并拉取仓库：
 
@@ -93,11 +105,13 @@ sudo python3 -m venv /opt/simple-twitter-monitor/.venv
 sudo /opt/simple-twitter-monitor/.venv/bin/pip install -r /opt/simple-twitter-monitor/requirements.txt
 ```
 
-安装只含占位值的环境文件，再编辑填入凭据：
+复制 `.env.example` 并填入凭据。设置为 root 所有、服务组可读（`0640`），这样 monitor 用户可加载配置，但其他用户无法读取：
 
 ```bash
-sudo install -o root -g root -m 600 /opt/simple-twitter-monitor/deploy/systemd/workbuddy-monitor.env.example /etc/workbuddy-monitor.env
-sudoedit /etc/workbuddy-monitor.env
+sudo install -o root -g workbuddy-monitor -m 640 /opt/simple-twitter-monitor/.env.example /opt/simple-twitter-monitor/.env
+sudoedit /opt/simple-twitter-monitor/.env
+sudo chown root:workbuddy-monitor /opt/simple-twitter-monitor/.env
+sudo chmod 640 /opt/simple-twitter-monitor/.env
 ```
 
 确保 `SCWEET_AUTH_TOKEN`、钉钉 `WEBHOOK_URL` 和 `DINGTALK_SECRET` 已填写。第一次先保留 `DRY_RUN=true`，这样会抓取和筛选，但不发通知。
@@ -112,10 +126,12 @@ sudo systemctl start workbuddy-monitor.service
 sudo journalctl -u workbuddy-monitor.service -n 100 --no-pager
 ```
 
-确认抓取成功后，将环境文件里的 `DRY_RUN=true` 改为 `false`，再启用每日定时运行：
+确认抓取成功后，将 `.env` 里的 `DRY_RUN=true` 改为 `false`，再启用每日定时运行：
 
 ```bash
-sudoedit /etc/workbuddy-monitor.env
+sudoedit /opt/simple-twitter-monitor/.env
+sudo chown root:workbuddy-monitor /opt/simple-twitter-monitor/.env
+sudo chmod 640 /opt/simple-twitter-monitor/.env
 sudo systemctl enable --now workbuddy-monitor.timer
 sudo systemctl list-timers workbuddy-monitor.timer
 ```
@@ -149,7 +165,7 @@ Webhook 发送失败时，推文会保留为待通知状态，后续运行会重
 
 ## 7. 安全提示
 
-- `SCWEET_AUTH_TOKEN`、`SCWEET_CT0` 和通知 Webhook 都是秘密；VPS 环境文件应由 root 所有且权限为 `0600`。
+- `SCWEET_AUTH_TOKEN`、`SCWEET_CT0` 和通知 Webhook 都是秘密；VPS 的 `.env` 应由 root 所有、权限为 `0640`，并只允许 monitor 服务组读取。
 - 不要将真实凭据放入 `.env.example`、代码、日志、Issue 或公开仓库。
 - Scweet 是非官方客户端，X 的接口、登录验证和限流策略变化可能导致抓取中断。遇到失败时先查看 `journalctl` 日志；不要在日志中打印 Cookie。
 - SQLite 文件已由 `.gitignore` 排除，不要提交这些文件。

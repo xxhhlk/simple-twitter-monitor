@@ -19,6 +19,7 @@ from email.utils import parsedate_to_datetime
 from typing import Any, Iterable
 
 import requests
+from dotenv import load_dotenv
 
 LOG = logging.getLogger("workbuddy-free-monitor")
 
@@ -194,6 +195,7 @@ def parse_bool(value: str | None, default: bool = False) -> bool:
 
 
 def load_settings() -> Settings:
+    load_dotenv(dotenv_path=Path(__file__).resolve().parent / ".env", override=False)
     auth_token = os.environ.get("SCWEET_AUTH_TOKEN", "").strip()
     if not auth_token:
         raise ValueError("缺少 SCWEET_AUTH_TOKEN 环境变量（X 账号的 auth_token Cookie）")

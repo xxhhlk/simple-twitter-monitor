@@ -8,7 +8,6 @@ Type=oneshot
 User=workbuddy-monitor
 Group=workbuddy-monitor
 WorkingDirectory=/opt/simple-twitter-monitor
-EnvironmentFile=/etc/workbuddy-monitor.env
 Environment=DB_PATH=/var/lib/workbuddy-monitor/monitor.db
 Environment=SCWEET_DB_PATH=/var/lib/workbuddy-monitor/scweet_state.db
 StateDirectory=workbuddy-monitor
